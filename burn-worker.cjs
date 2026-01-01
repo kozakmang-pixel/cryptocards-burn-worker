@@ -1,5 +1,5 @@
 // burn-worker.cjs
-// CRYPTOCARDS Burn Worker - runs on Railway, does SOL -> $CRYPTOCARDS swaps via Jupiter
+// CRYPTOCARDS Burn Worker - runs on Railway, does SOL -> $CRYPTOCARDS swaps via Jupiter v6
 
 require('dotenv').config();
 
@@ -40,10 +40,11 @@ const BURN_THRESHOLD_SOL = Number(
 // Auth token for backend -> worker calls
 const BURN_AUTH_TOKEN = process.env.BURN_AUTH_TOKEN || '';
 
-// Jupiter Lite API base URL
-const JUPITER_BASE_URL =
-  process.env.JUPITER_BASE_URL ||
-  'https://lite-api.jup.ag/swap/v1';
+// Optional Jupiter API key (if you ever get one)
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY || null;
+
+// Solana "native SOL" mint
+const SOL_MINT_ADDRESS = 'So11111111111111111111111111111111111111112';
 
 // --- BASIC CHECKS ------------------------------------------------------------
 
@@ -101,11 +102,11 @@ function getBurnKeypair() {
   }
 }
 
-// --- CORE SWAP LOGIC --------------------------------------------------------
+// --- CORE SWAP LOGIC (JUPITER V6) -------------------------------------------
 
 /**
- * Very important change:
- *  - We leave a bigger safety buffer for fees + rent.
+ * Very important:
+ *  - We leave a safety buffer for fees + rent.
  *  - Only swap ~70% of spendable SOL over a 0.01 SOL buffer.
  * This avoids "Transfer: insufficient lamports" simulation failures.
  */
@@ -168,7 +169,7 @@ async function runBurnSwap() {
       };
     }
 
-    // 2) Decide how much SOL to swap (THIS IS THE PART WE FIXED)
+    // 2) Decide how much SOL to swap (THIS IS THE SAFETY LOGIC)
 
     const LAMPORTS_PER_SOL = web3.LAMPORTS_PER_SOL;
 
@@ -229,71 +230,106 @@ async function runBurnSwap() {
       )} SOL (${swapLamports} lamports) from wallet ${burnPubkey.toBase58()}`
     );
 
-    // 3) Build swap transaction via Jupiter Lite API
-
     const fetch = (await import('node-fetch')).default;
 
-    const body = {
-      // Basic swap params
-      inputMint: 'So11111111111111111111111111111111111111112', // SOL
-      outputMint: CRYPTOCARDS_MINT,
-      amount: swapLamports.toString(), // amount in lamports
-      slippageBps: 100, // 1% slippage
+    // 3) Get a quote from Jupiter v6
+    const quoteUrl =
+      `https://quote-api.jup.ag/v6/quote` +
+      `?inputMint=${encodeURIComponent(SOL_MINT_ADDRESS)}` +
+      `&outputMint=${encodeURIComponent(CRYPTOCARDS_MINT)}` +
+      `&amount=${swapLamports.toString()}` +
+      `&slippageBps=100`;
 
-      // Who is swapping
-      userPublicKey: burnPubkey.toBase58(),
+    console.log('[WORKER] GET', quoteUrl);
 
-      // Helpful flags
-      wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true,
-      // prioritizationFeeLamports: 0, // let Jupiter decide
-    };
-
-    console.log(
-      '[WORKER] POST',
-      JUPITER_BASE_URL,
-      'body=',
-      JSON.stringify(body)
-    );
-
-    const res = await fetch(JUPITER_BASE_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
+    const quoteRes = await fetch(quoteUrl);
+    if (!quoteRes.ok) {
+      const text = await quoteRes.text().catch(() => null);
       console.error(
-        '[WORKER] Jupiter Lite API error, status =',
-        res.status
+        '[WORKER] Jupiter quote error, status =',
+        quoteRes.status,
+        'body =',
+        text
       );
-      const text = await res.text().catch(() => null);
       return {
         ok: false,
-        error: 'jupiter_http_error',
-        status: res.status,
+        error: 'quote_http_error',
+        status: quoteRes.status,
         body: text,
       };
     }
 
-    const json = await res.json();
-    const swapTransaction = json.swapTransaction || json.swapTransactionBase64;
+    const quoteResponse = await quoteRes.json();
+    if (!quoteResponse) {
+      console.error(
+        '[WORKER] Invalid quoteResponse from Jupiter'
+      );
+      return {
+        ok: false,
+        error: 'invalid_quote_response',
+      };
+    }
+
+    // 4) Build swap transaction via Jupiter v6 swap
+    const swapBody = {
+      quoteResponse,
+      userPublicKey: burnPubkey.toBase58(),
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+    };
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (JUPITER_API_KEY) {
+      headers['x-api-key'] = JUPITER_API_KEY;
+    }
+
+    console.log(
+      '[WORKER] POST https://quote-api.jup.ag/v6/swap body=',
+      JSON.stringify(swapBody)
+    );
+
+    const swapRes = await fetch(
+      'https://quote-api.jup.ag/v6/swap',
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(swapBody),
+      }
+    );
+
+    if (!swapRes.ok) {
+      const text = await swapRes.text().catch(() => null);
+      console.error(
+        '[WORKER] Jupiter swap build error, status =',
+        swapRes.status,
+        'body =',
+        text
+      );
+      return {
+        ok: false,
+        error: 'swap_build_http_error',
+        status: swapRes.status,
+        body: text,
+      };
+    }
+
+    const swapJson = await swapRes.json();
+    const swapTransaction =
+      swapJson.swapTransaction || swapJson.swapTransactionBase64;
 
     if (!swapTransaction) {
       console.error(
-        '[WORKER] Jupiter response missing swapTransaction field',
-        json
+        '[WORKER] Missing swapTransaction in Jupiter response',
+        swapJson
       );
       return {
         ok: false,
         error: 'missing_swap_transaction',
-        raw: json,
+        raw: swapJson,
       };
     }
 
-    // 4) Deserialize, sign, send and confirm
+    // 5) Deserialize, sign, send and confirm
 
     const swapTxBuf = Buffer.from(swapTransaction, 'base64');
     const tx = web3.VersionedTransaction.deserialize(swapTxBuf);
@@ -377,7 +413,7 @@ app.get('/health', async (_req, res) => {
       balanceSol: solBalance,
       rpc: SOLANA_RPC_URL,
       thresholdSol: BURN_THRESHOLD_SOL,
-      jupiterBaseUrl: JUPITER_BASE_URL,
+      jupiterBaseUrl: 'https://quote-api.jup.ag/v6',
     });
   } catch (err) {
     console.error('Error in /health:', err);
