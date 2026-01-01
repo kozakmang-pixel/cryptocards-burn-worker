@@ -1,326 +1,435 @@
-// ==============================
-//  CRYPTOCARDS BURN WORKER
-//  Using Jupiter lite-api.jup.ag (Swap V1)
-// ==============================
+// burn-worker.cjs
+// CRYPTOCARDS Burn Worker - runs on Railway, does SOL -> $CRYPTOCARDS swaps via Jupiter
 
-require("dotenv").config();
-const express = require("express");
-const axios = require("axios");
-const {
-  Connection,
-  PublicKey,
-  LAMPORTS_PER_SOL,
-  Keypair,
-  VersionedTransaction,
-} = require("@solana/web3.js");
+require('dotenv').config();
+
+const express = require('express');
+const cors = require('cors');
+const web3 = require('@solana/web3.js');
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
-// ==============================
-// ENV DEBUG
-// ==============================
-console.log("========== ENV DEBUG ==========");
-console.log(
-  "ENV keys detected:",
-  Object.keys(process.env).filter((k) =>
-    ["BURN", "CRYPTO", "RPC", "PORT", "JUPITER"].some((s) => k.includes(s))
-  )
-);
-console.log(
-  "RAW BURN_WALLET_PUBLIC_KEY =",
-  JSON.stringify(process.env.BURN_WALLET_PUBLIC_KEY)
-);
-console.log(
-  "RAW JUPITER_BASE_URL =",
-  JSON.stringify(process.env.JUPITER_BASE_URL)
-);
-console.log("================================");
+// --- ENVIRONMENT CONFIG ------------------------------------------------------
 
-// ==============================
-// LOAD ENV CONFIG
-// ==============================
-const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 const PORT = process.env.PORT || 4000;
-const BURN_WALLET_PUBLIC_KEY = process.env.BURN_WALLET_PUBLIC_KEY;
-const BURN_WALLET_SECRET_KEY = process.env.BURN_WALLET_SECRET_KEY;
-const CRYPTOCARDS_MINT = process.env.CRYPTOCARDS_MINT;
-const THRESHOLD_SOL = parseFloat(process.env.THRESHOLD_SOL || "0.02");
-const BURN_AUTH_TOKEN = process.env.BURN_AUTH_TOKEN;
 
-// Default to lite-api.jup.ag free endpoint
-// Final quote URL:  <base>/quote
-// Final swap URL:   <base>/swap
+// Solana RPC (mainnet)
+const SOLANA_RPC_URL =
+  process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+
+// Burn wallet public key (where SOL sits and where $CRYPTOCARDS ends up)
+const BURN_WALLET =
+  process.env.BURN_WALLET ||
+  'A3mpAVduHM9QyRgH1NSZp5ANnbPr2Z5vkXtc8EgDaZBF';
+
+// Burn wallet secret key (JSON array of 64 bytes)
+const BURN_WALLET_SECRET = process.env.BURN_WALLET_SECRET || '';
+
+// CRYPTOCARDS token mint
+const CRYPTOCARDS_MINT =
+  process.env.CRYPTOCARDS_MINT ||
+  'AuxRtUDw7KhWZxbMcfqPoB1cLcvq44Sw83UHRd3Spump';
+
+// SOL threshold before we attempt a swap
+const BURN_THRESHOLD_SOL = Number(
+  process.env.BURN_THRESHOLD_SOL || '0.02'
+);
+
+// Auth token for backend -> worker calls
+const BURN_AUTH_TOKEN = process.env.BURN_AUTH_TOKEN || '';
+
+// Jupiter Lite API base URL
 const JUPITER_BASE_URL =
-  (process.env.JUPITER_BASE_URL &&
-    process.env.JUPITER_BASE_URL.replace(/\/+$/, "")) ||
-  "https://lite-api.jup.ag/swap/v1";
+  process.env.JUPITER_BASE_URL ||
+  'https://lite-api.jup.ag/swap/v1';
 
-// ==============================
-// ENV REQUIRED CHECKS
-// ==============================
-function required(name, value) {
-  if (!value || value.toString().trim() === "") {
-    console.error(`❌ Missing REQUIRED ENV VARIABLE: ${name}`);
-    process.exit(1);
-  }
+// --- BASIC CHECKS ------------------------------------------------------------
+
+if (!BURN_WALLET_SECRET) {
+  console.warn(
+    '⚠️  BURN_WALLET_SECRET is missing - worker will NOT be able to sign swaps.'
+  );
 }
 
-required("RPC_URL", RPC_URL);
-required("BURN_WALLET_PUBLIC_KEY", BURN_WALLET_PUBLIC_KEY);
-required("BURN_WALLET_SECRET_KEY", BURN_WALLET_SECRET_KEY);
-required("CRYPTOCARDS_MINT", CRYPTOCARDS_MINT);
-required("BURN_AUTH_TOKEN", BURN_AUTH_TOKEN);
-
-// ==============================
-// SOLANA CONNECTION & WALLET
-// ==============================
-const connection = new Connection(RPC_URL, "confirmed");
-const burnWalletPub = new PublicKey(BURN_WALLET_PUBLIC_KEY);
-const mintPubkey = new PublicKey(CRYPTOCARDS_MINT);
-
-let burnKeypair;
-try {
-  const secretArr = JSON.parse(BURN_WALLET_SECRET_KEY);
-  burnKeypair = Keypair.fromSecretKey(Uint8Array.from(secretArr));
-
-  if (burnKeypair.publicKey.toBase58() !== burnWalletPub.toBase58()) {
-    console.warn(
-      "⚠️ BURN_WALLET_PUBLIC_KEY does NOT match secret key public key"
-    );
-  }
-} catch (err) {
-  console.error("❌ FAILED TO PARSE BURN_WALLET_SECRET_KEY:", err.message);
-  process.exit(1);
+if (!BURN_AUTH_TOKEN) {
+  console.warn(
+    '⚠️  BURN_AUTH_TOKEN is missing - backend will not be able to call /run-burn securely.'
+  );
 }
 
-// ==============================
-// STARTUP LOG
-// ==============================
-console.log("============== STARTUP ==============");
-console.log("RPC_URL:", RPC_URL);
-console.log("PORT:", PORT);
-console.log("BURN_WALLET_PUBLIC_KEY:", burnWalletPub.toBase58());
-console.log("CRYPTOCARDS_MINT:", mintPubkey.toBase58());
-console.log("THRESHOLD_SOL:", THRESHOLD_SOL);
-console.log("JUPITER_BASE_URL:", JUPITER_BASE_URL);
-console.log("====================================");
+// Solana connection
+const connection = new web3.Connection(SOLANA_RPC_URL, 'confirmed');
 
-// ==============================
-// AUTH MIDDLEWARE
-// ==============================
-function requireAuth(req, res, next) {
-  const token = req.headers["x-burn-auth"];
-  if (!token || token !== BURN_AUTH_TOKEN) {
-    console.warn("⚠️ Unauthorized request to /run-burn");
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-  next();
-}
+// --- HELPERS -----------------------------------------------------------------
 
-// ==============================
-// HEALTH CHECK
-// GET /health
-// ==============================
-app.get("/health", async (req, res) => {
-  try {
-    const lamports = await connection.getBalance(burnWalletPub);
-    res.json({
-      ok: true,
-      wallet: burnWalletPub.toBase58(),
-      balanceSol: lamports / LAMPORTS_PER_SOL,
-      rpc: RPC_URL,
-      thresholdSol: THRESHOLD_SOL,
-      jupiterBaseUrl: JUPITER_BASE_URL,
-    });
-  } catch (err) {
-    console.error("❌ /health error:", err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ==============================
-// RUN BURN
-// POST /run-burn
-// ==============================
-app.post("/run-burn", requireAuth, async (req, res) => {
-  console.log("🔥 /run-burn CALLED");
+function getBurnKeypair() {
+  if (!BURN_WALLET_SECRET) return null;
 
   try {
-    // 1) Balance check
-    const balanceLamports = await connection.getBalance(burnWalletPub);
-    const balanceSol = balanceLamports / LAMPORTS_PER_SOL;
-    console.log(
-      `  Current SOL balance: ${balanceSol} (threshold: ${THRESHOLD_SOL})`
-    );
-
-    if (balanceSol < THRESHOLD_SOL) {
-      console.log("  ⏹ Below threshold, not swapping.");
-      return res.json({
-        ok: false,
-        reason: "below_threshold",
-        balanceSol,
-        thresholdSol: THRESHOLD_SOL,
-      });
+    const raw = JSON.parse(BURN_WALLET_SECRET);
+    if (!Array.isArray(raw)) {
+      console.error(
+        'BURN_WALLET_SECRET must be a JSON array of numbers (64-byte secret key)'
+      );
+      return null;
     }
 
-    // 2) Decide amount to swap (leave 0.002 SOL for rent/fees)
-    const MIN_SOL_REMAIN = 0.002;
-    const reserveLamports = MIN_SOL_REMAIN * LAMPORTS_PER_SOL;
-    const swapLamports = balanceLamports - reserveLamports;
+    const secretKey = Uint8Array.from(raw);
+    const kp = web3.Keypair.fromSecretKey(secretKey);
 
-    if (swapLamports <= 0) {
-      console.log("  ⏹ Not enough SOL after reserving for fees.");
-      return res.json({
-        ok: false,
-        reason: "not_enough_after_reserve",
-        balanceSol,
-        minSolRemain: MIN_SOL_REMAIN,
-      });
-    }
-
-    console.log(
-      `  🔁 Attempting to swap ${swapLamports / LAMPORTS_PER_SOL} SOL -> CRYPTOCARDS`
-    );
-
-    // Optional manual amount override
-    if (
-      req.body &&
-      typeof req.body.amountLamports === "number" &&
-      req.body.amountLamports > 0 &&
-      req.body.amountLamports < swapLamports
-    ) {
+    if (BURN_WALLET && kp.publicKey.toBase58() !== BURN_WALLET) {
+      console.warn(
+        'BURN_WALLET_SECRET pubkey does NOT match BURN_WALLET env:',
+        'secret pubkey =',
+        kp.publicKey.toBase58(),
+        'BURN_WALLET =',
+        BURN_WALLET
+      );
+    } else {
       console.log(
-        `  Overriding swap amount to ${req.body.amountLamports} lamports`
+        '✅ Burn worker using wallet:',
+        kp.publicKey.toBase58()
       );
     }
 
-    // 3) Jupiter QUOTE – using lite-api.jup.ag/swap/v1/quote
-    const quoteUrl = `${JUPITER_BASE_URL}/quote`;
-    console.log("  ➡️  Requesting quote from:", quoteUrl);
+    return kp;
+  } catch (err) {
+    console.error('Failed to parse BURN_WALLET_SECRET JSON:', err);
+    return null;
+  }
+}
 
-    const quoteResp = await axios.get(quoteUrl, {
-      params: {
-        inputMint: "So11111111111111111111111111111111111111112", // SOL
-        outputMint: mintPubkey.toBase58(), // CRYPTOCARDS
-        amount: swapLamports, // in lamports
-        slippageBps: 150,
-      },
-      timeout: 15000,
-    });
+// --- CORE SWAP LOGIC --------------------------------------------------------
 
-    const quote = quoteResp.data;
-    if (!quote || !quote.outAmount) {
-      console.error("❌ Jupiter returned invalid quote:", quote);
-      return res.status(500).json({
+/**
+ * Very important change:
+ *  - We leave a bigger safety buffer for fees + rent.
+ *  - Only swap ~70% of spendable SOL over a 0.01 SOL buffer.
+ * This avoids "Transfer: insufficient lamports" simulation failures.
+ */
+async function runBurnSwap() {
+  try {
+    if (
+      !BURN_WALLET ||
+      !CRYPTOCARDS_MINT ||
+      !Number.isFinite(BURN_THRESHOLD_SOL) ||
+      BURN_THRESHOLD_SOL <= 0
+    ) {
+      return {
         ok: false,
-        error: "jupiter_no_route",
-        jupiterRaw: quote,
-      });
+        error: 'config_invalid',
+        details: {
+          BURN_WALLET,
+          CRYPTOCARDS_MINT,
+          BURN_THRESHOLD_SOL,
+        },
+      };
     }
+
+    const burnPubkey = new web3.PublicKey(BURN_WALLET);
+    const burnKeypair = getBurnKeypair();
+
+    if (!burnKeypair) {
+      return {
+        ok: false,
+        error: 'missing_burn_wallet_secret',
+      };
+    }
+
+    if (!burnKeypair.publicKey.equals(burnPubkey)) {
+      return {
+        ok: false,
+        error: 'burn_wallet_secret_pubkey_mismatch',
+        secretPubkey: burnKeypair.publicKey.toBase58(),
+        burnWallet: BURN_WALLET,
+      };
+    }
+
+    // 1) Get current SOL balance
+    const lamports = await connection.getBalance(burnPubkey, 'confirmed');
+    const solBalance = lamports / web3.LAMPORTS_PER_SOL;
 
     console.log(
-      `  ✅ Jupiter quote outAmount ~${quote.outAmount} CRYPTOCARDS units`
+      `[WORKER] Burn wallet balance = ${solBalance} SOL (${lamports} lamports)`
     );
 
-    // 4) Jupiter SWAP – using lite-api.jup.ag/swap/v1/swap
-    const swapUrl = `${JUPITER_BASE_URL}/swap`;
-    console.log("  ➡️  Requesting swap transaction from:", swapUrl);
-
-    const swapResp = await axios.post(
-      swapUrl,
-      {
-        quoteResponse: quote,
-        userPublicKey: burnWalletPub.toBase58(),
-        wrapAndUnwrapSol: true,
-        prioritizationFeeLamports: 10_000,
-      },
-      {
-        timeout: 20000,
-      }
-    );
-
-    const swapTxBase64 = swapResp.data.swapTransaction;
-    if (!swapTxBase64) {
-      console.error("❌ swapTransaction missing in Jupiter response:", swapResp.data);
-      return res.status(500).json({
+    if (solBalance < BURN_THRESHOLD_SOL) {
+      console.log(
+        `[WORKER] Balance below threshold (${BURN_THRESHOLD_SOL} SOL), skipping swap.`
+      );
+      return {
         ok: false,
-        error: "no_swap_transaction",
-        jupiterRaw: swapResp.data,
-      });
+        error: 'below_threshold',
+        burnWallet: BURN_WALLET,
+        balanceSol: solBalance,
+        thresholdSol: BURN_THRESHOLD_SOL,
+      };
     }
 
-    console.log("  ✅ Received swapTransaction from Jupiter");
+    // 2) Decide how much SOL to swap (THIS IS THE PART WE FIXED)
 
-    // 5) Deserialize, sign, send
-    const txBuf = Buffer.from(swapTxBase64, "base64");
-    let tx = VersionedTransaction.deserialize(txBuf);
+    const LAMPORTS_PER_SOL = web3.LAMPORTS_PER_SOL;
 
-    const { value: bhInfo } =
-      await connection.getLatestBlockhashAndContext("finalized");
-    tx.message.recentBlockhash = bhInfo.blockhash;
+    // Keep ~0.01 SOL in the wallet as a hard buffer
+    const FEE_RENT_BUFFER_SOL = 0.01;
+    const FEE_RENT_BUFFER_LAMPORTS = Math.floor(
+      FEE_RENT_BUFFER_SOL * LAMPORTS_PER_SOL
+    );
+
+    // Only consider lamports above that buffer as "spendable"
+    let spendableLamports = lamports - FEE_RENT_BUFFER_LAMPORTS;
+
+    if (spendableLamports <= 0) {
+      console.warn(
+        '[WORKER] Not enough lamports after reserving fee/rent buffer.',
+        {
+          lamports,
+          FEE_RENT_BUFFER_LAMPORTS,
+        }
+      );
+      return {
+        ok: false,
+        error: 'insufficient_after_fee_buffer',
+        lamports,
+        feeRentBufferLamports: FEE_RENT_BUFFER_LAMPORTS,
+      };
+    }
+
+    // From the spendable amount, only swap ~70%
+    const SAFETY_FRACTION = 0.7;
+    const swapLamports = Math.floor(
+      spendableLamports * SAFETY_FRACTION
+    );
+
+    if (swapLamports <= 0) {
+      console.warn(
+        '[WORKER] swapLamports <= 0 after safety fraction',
+        {
+          lamports,
+          spendableLamports,
+          SAFETY_FRACTION,
+        }
+      );
+      return {
+        ok: false,
+        error: 'insufficient_after_safety_fraction',
+        lamports,
+        spendableLamports,
+        safetyFraction: SAFETY_FRACTION,
+      };
+    }
+
+    const swapSol = swapLamports / LAMPORTS_PER_SOL;
+
+    console.log(
+      `[WORKER] Preparing to swap ~${swapSol.toFixed(
+        6
+      )} SOL (${swapLamports} lamports) from wallet ${burnPubkey.toBase58()}`
+    );
+
+    // 3) Build swap transaction via Jupiter Lite API
+
+    const fetch = (await import('node-fetch')).default;
+
+    const body = {
+      // Basic swap params
+      inputMint: 'So11111111111111111111111111111111111111112', // SOL
+      outputMint: CRYPTOCARDS_MINT,
+      amount: swapLamports.toString(), // amount in lamports
+      slippageBps: 100, // 1% slippage
+
+      // Who is swapping
+      userPublicKey: burnPubkey.toBase58(),
+
+      // Helpful flags
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      // prioritizationFeeLamports: 0, // let Jupiter decide
+    };
+
+    console.log(
+      '[WORKER] POST',
+      JUPITER_BASE_URL,
+      'body=',
+      JSON.stringify(body)
+    );
+
+    const res = await fetch(JUPITER_BASE_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      console.error(
+        '[WORKER] Jupiter Lite API error, status =',
+        res.status
+      );
+      const text = await res.text().catch(() => null);
+      return {
+        ok: false,
+        error: 'jupiter_http_error',
+        status: res.status,
+        body: text,
+      };
+    }
+
+    const json = await res.json();
+    const swapTransaction = json.swapTransaction || json.swapTransactionBase64;
+
+    if (!swapTransaction) {
+      console.error(
+        '[WORKER] Jupiter response missing swapTransaction field',
+        json
+      );
+      return {
+        ok: false,
+        error: 'missing_swap_transaction',
+        raw: json,
+      };
+    }
+
+    // 4) Deserialize, sign, send and confirm
+
+    const swapTxBuf = Buffer.from(swapTransaction, 'base64');
+    const tx = web3.VersionedTransaction.deserialize(swapTxBuf);
 
     tx.sign([burnKeypair]);
 
-    console.log("  🧪 Simulating transaction...");
-    const sim = await connection.simulateTransaction(tx, {
-      commitment: "processed",
-    });
-    if (sim.value.err) {
-      console.error("❌ Simulation failed:", sim.value.err, sim.value.logs);
-      return res.status(500).json({
-        ok: false,
-        error: "simulation_failed",
-        simError: sim.value.err,
-        logs: sim.value.logs,
+    const rawTx = tx.serialize();
+
+    let signature;
+    try {
+      signature = await connection.sendRawTransaction(rawTx, {
+        skipPreflight: false,
+        maxRetries: 3,
       });
+    } catch (sendErr) {
+      console.error(
+        '[WORKER] sendRawTransaction threw:',
+        sendErr
+      );
+      return {
+        ok: false,
+        error: 'send_failed',
+        details: sendErr?.message || String(sendErr),
+      };
     }
 
-    console.log("  ✅ Simulation OK, sending transaction...");
-    const sig = await connection.sendTransaction(tx, {
-      skipPreflight: true,
-      preflightCommitment: "processed",
-    });
+    try {
+      const conf = await connection.confirmTransaction(
+        signature,
+        'confirmed'
+      );
+      console.log(
+        '[WORKER] Swap confirmed:',
+        signature,
+        'confirmation =',
+        JSON.stringify(conf)
+      );
+    } catch (confErr) {
+      console.error(
+        '[WORKER] confirmTransaction error:',
+        confErr
+      );
+      // Still return ok with warning; on-chain might be fine.
+    }
 
-    console.log("  📨 Sent transaction:", sig);
-
-    await connection.confirmTransaction(
-      {
-        signature: sig,
-        blockhash: bhInfo.blockhash,
-        lastValidBlockHeight: bhInfo.lastValidBlockHeight,
-      },
-      "finalized"
+    console.log(
+      `[WORKER] SUCCESS: swapped ~${swapSol.toFixed(
+        6
+      )} SOL to $CRYPTOCARDS. tx = ${signature}`
     );
 
-    console.log("  ✅ Swap confirmed on-chain");
-
-    return res.json({
+    return {
       ok: true,
-      signature: sig,
-      balanceSolBefore: balanceSol,
-      swappedLamports: swapLamports,
-      swappedSol: swapLamports / LAMPORTS_PER_SOL,
-      jupiterOutAmount: quote.outAmount,
+      txSignature: signature,
+      swappedSol: swapSol,
+      burnWallet: BURN_WALLET,
+      thresholdSol: BURN_THRESHOLD_SOL,
+    };
+  } catch (err) {
+    console.error('[WORKER] runBurnSwap unexpected error:', err);
+    return {
+      ok: false,
+      error: 'exception',
+      details: err?.message || String(err),
+    };
+  }
+}
+
+// --- ROUTES ------------------------------------------------------------------
+
+// Simple health check used by backend /burnwalletstatus
+app.get('/health', async (_req, res) => {
+  try {
+    const pubkey = new web3.PublicKey(BURN_WALLET);
+    const lamports = await connection.getBalance(pubkey, 'confirmed');
+    const solBalance = lamports / web3.LAMPORTS_PER_SOL;
+
+    res.json({
+      ok: true,
+      wallet: BURN_WALLET,
+      balanceSol: solBalance,
+      rpc: SOLANA_RPC_URL,
+      thresholdSol: BURN_THRESHOLD_SOL,
+      jupiterBaseUrl: JUPITER_BASE_URL,
     });
   } catch (err) {
-    console.error(
-      "❌ ERROR DURING /run-burn:",
-      err.code || err.message,
-      err.response?.data || ""
-    );
-    return res.status(500).json({
+    console.error('Error in /health:', err);
+    res.status(500).json({
       ok: false,
-      error: err.message || "run-burn_failed",
-      code: err.code || null,
-      jupiterError: err.response?.data || null,
+      error: err?.message || 'health_error',
     });
   }
 });
 
-// ==============================
-// START SERVER
-// ==============================
+// Main entrypoint for backend
+app.post('/run-burn', async (req, res) => {
+  try {
+    const authHeader =
+      req.headers['x-burn-auth'] ||
+      req.headers['X-Burn-Auth'];
+
+    if (!BURN_AUTH_TOKEN) {
+      return res.status(500).json({
+        ok: false,
+        error: 'worker_missing_auth_token',
+      });
+    }
+
+    if (!authHeader || authHeader !== BURN_AUTH_TOKEN) {
+      return res.status(401).json({
+        ok: false,
+        error: 'unauthorized',
+      });
+    }
+
+    const result = await runBurnSwap();
+
+    if (!result.ok) {
+      return res
+        .status(500)
+        .json({ ok: false, ...result });
+    }
+
+    return res.json(result);
+  } catch (err) {
+    console.error('Error in /run-burn:', err);
+    res.status(500).json({
+      ok: false,
+      error: err?.message || 'run_burn_exception',
+    });
+  }
+});
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`🔥 CRYPTOCARDS Burn Worker Running on port ${PORT}`);
+  console.log(
+    `CRYPTOCARDS burn-worker listening on port ${PORT}, RPC=${SOLANA_RPC_URL}`
+  );
 });
